@@ -1,0 +1,36 @@
+name: edge-gateway-demo
+
+services:
+  upstream-a:
+    build: ./upstream
+    environment:
+      UPSTREAM_NAME: alpha
+      DEFAULT_DELAY_MS: "3000"   # 默认响应延迟，可被请求参数 delay_ms 覆盖
+    ports:
+      - "9001:8000"
+
+  upstream-b:
+    build: ./upstream
+    environment:
+      UPSTREAM_NAME: beta
+      DEFAULT_DELAY_MS: "500"
+    ports:
+      - "9002:8000"
+
+  gateway:
+    build: ./gateway
+    environment:
+      # 已登记的上游清单；启动时写入 SQLite，重启后按已登记路由接流量
+      UPSTREAMS: "alpha=http://upstream-a:8000;beta=http://upstream-b:8000"
+      INITIAL_TARGET: alpha
+      GATEWAY_DB: /data/gateway.db
+    ports:
+      - "8080:8000"
+    volumes:
+      - gateway-data:/data
+    depends_on:
+      - upstream-a
+      - upstream-b
+
+volumes:
+  gateway-data:

@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>边缘网关值班台</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f4f6f8; color: #1c2733; }
+  header { background: #12314e; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0 0 6px; font-size: 20px; }
+  header .summary { font-size: 14px; opacity: .95; }
+  header .summary b { color: #ffd166; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 24px; }
+  section { background: #fff; border: 1px solid #dde3ea; border-radius: 8px; padding: 14px 16px; }
+  section h2 { margin: 0 0 10px; font-size: 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { border: 1px solid #e3e8ee; padding: 6px 8px; text-align: left; }
+  th { background: #f0f3f7; }
+  tr.cur td { background: #e8f6ec; }
+  tr.draining td { background: #fff6e0; }
+  tr.offlinable td { background: #eef2f7; color: #4a5a6a; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .badge.cur { background: #1f9d55; color: #fff; }
+  .badge.draining { background: #e8a13a; color: #fff; }
+  .badge.offlinable { background: #607d8b; color: #fff; }
+  button { padding: 6px 14px; border: 0; border-radius: 6px; background: #1266a8;
+           color: #fff; cursor: pointer; font-size: 14px; }
+  button:disabled { background: #9db4c6; cursor: not-allowed; }
+  button.warn { background: #c25e1d; }
+  input, select { padding: 5px 8px; border: 1px solid #b9c4cf; border-radius: 6px; font-size: 14px; }
+  ul { margin: 8px 0 0; padding-left: 18px; font-size: 13px; max-height: 220px; overflow-y: auto; }
+  .msg { margin-top: 8px; font-size: 14px; min-height: 20px; }
+  .msg.ok { color: #1f7a3d; }
+  .msg.err { color: #b3261e; }
+  .muted { color: #6b7a89; font-size: 12px; }
+  #req-log li.done { color: #1f7a3d; }
+  #req-log li.fail { color: #b3261e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>边缘网关值班台</h1>
+  <div class="summary" id="route-summary">加载中…</div>
+</header>
+<main>
+  <section>
+    <h2>发起转发请求</h2>
+    <label>响应延迟(ms) <input id="delay" type="number" value="3000" min="0" max="60000" style="width:90px"></label>
+    <button onclick="fire(1)">发送 1 个</button>
+    <button onclick="fire(5)">并发 5 个</button>
+    <span class="muted">请求在接纳时绑定当时的目标，切换后仍从原上游取回完整响应</span>
+    <ul id="req-log"></ul>
+  </section>
+
+  <section>
+    <h2>切换目标（先探测，后确认）</h2>
+    <div>
+      候选目标 <select id="candidate"></select>
+      <button onclick="doProbe()">探测候选</button>
+      <button id="btn-commit" class="warn" disabled onclick="doCommit()">确认切换</button>
+    </div>
+    <div class="msg" id="switch-msg"></div>
+    <div class="muted" id="version-hint"></div>
+    <h2 style="margin-top:14px">最近探测</h2>
+    <ul id="probe-log"></ul>
+  </section>
+
+  <section>
+    <h2>上游与在途数</h2>
+    <table>
+      <thead><tr><th>名称</th><th>地址</th><th>角色</th><th>在途</th><th>状态</th></tr></thead>
+      <tbody id="upstream-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>在途请求明细</h2>
+    <ul id="inflight-list"></ul>
+  </section>
+</main>
+
+<script>
+let state = null;
+let lastProbe = null;   // {target, base_version, probe_id, ok}
+let reqSeq = 0;
+const $ = (id) => document.getElementById(id);
+
+async function api(method, path, body) {
+  const opt = { method, headers: {} };
+  if (body !== undefined) {
+    opt.headers['content-type'] = 'application/json';
+    opt.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opt);
+  let j = null;
+  try { j = await r.json(); } catch (e) { /* non-json */ }
+  return { status: r.status, body: j };
+}
+
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+async function refresh() {
+  try {
+    const { body } = await api('GET', '/api/state');
+    if (body) { state = body; render(); }
+  } catch (e) { /* gateway restarting */ }
+}
+
+function render() {
+  const r = state.route;
+  let html = `当前目标 <b>${esc(r.current_target)}</b> · 路由版号 <b>v${r.version}</b> · ` +
+             `更新于 ${new Date(r.updated_at * 1000).toLocaleTimeString()}`;
+  if (state.boot && state.boot.cleared_inflight)
+    html += ` · 本次启动已清理中断在途 ${state.boot.cleared_inflight} 条`;
+  $('route-summary').innerHTML = html;
+
+  $('upstream-body').innerHTML = state.upstreams.map(u => {
+    let cls, badge;
+    if (u.is_current)      { cls = 'cur';        badge = '<span class="badge cur">当前目标</span>'; }
+    else if (u.inflight>0) { cls = 'draining';   badge = `<span class="badge draining">旧目标 · 排空中</span>`; }
+    else                   { cls = 'offlinable'; badge = '<span class="badge offlinable">旧目标 · 在途已清零，可下线 ✓</span>'; }
+    return `<tr class="${cls}"><td>${esc(u.name)}</td><td>${esc(u.url)}</td>` +
+           `<td>${u.is_current ? '当前' : '旧'}</td><td>${u.inflight}</td><td>${badge}</td></tr>`;
+  }).join('');
+
+  const sel = $('candidate');
+  const prev = sel.value;
+  sel.innerHTML = state.upstreams.filter(u => !u.is_current)
+    .map(u => `<option value="${esc(u.name)}">${esc(u.name)}</option>`).join('');
+  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+
+  $('inflight-list').innerHTML = state.inflight.map(x =>
+    `<li>#${x.id.slice(0,8)} → <b>${esc(x.target)}</b> ${esc(x.path)} · 已进行 ${x.age_ms}ms</li>`
+  ).join('') || '<li class="muted">（无在途请求）</li>';
+
+  $('probe-log').innerHTML = state.recent_probes.map(p =>
+    `<li>${new Date(p.created_at*1000).toLocaleTimeString()} 探测 <b>${esc(p.target)}</b> ` +
+    `@页面版号 v${p.base_version} → ${p.ok ? '成功' : '失败 ' + esc(p.detail.error || JSON.stringify(p.detail))}</li>`
+  ).join('') || '<li class="muted">（暂无）</li>';
+
+  updateSwitchPanel();
+}
+
+function updateSwitchPanel() {
+  const btn = $('btn-commit');
+  const hint = $('version-hint');
+  if (!lastProbe) { btn.disabled = true; hint.textContent = `页面所见版号 v${state.route.version}`; return; }
+  const sameTarget = lastProbe.target === $('candidate').value;
+  const versionOk = lastProbe.base_version === state.route.version;
+  btn.disabled = !(lastProbe.ok && sameTarget && versionOk);
+  hint.textContent = `页面所见版号 v${state.route.version} · 探测基于版号 v${lastProbe.base_version}` +
+    (versionOk ? '' : '（版号已变化，请重新探测）');
+}
+
+async function doProbe() {
+  const target = $('candidate').value;
+  if (!target) return;
+  const msg = $('switch-msg');
+  msg.className = 'msg'; msg.textContent = `探测 ${target} 中…（期间请求仍走旧目标）`;
+  const { body } = await api('POST', '/api/switch/probe',
+                             { target, base_version: state.route.version });
+  lastProbe = body && body.probe_id ? body : null;
+  if (body && body.ok) {
+    msg.className = 'msg ok';
+    msg.textContent = `探测成功：${target} 健康（基于版号 v${body.base_version}），可确认切换`;
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = `探测失败，维持原路由：${body && (body.error || JSON.stringify(body.detail)) || '未知错误'}`;
+  }
+  await refresh();
+}
+
+async function doCommit() {
+  if (!lastProbe) return;
+  const msg = $('switch-msg');
+  const { status, body } = await api('POST', '/api/switch/commit', {
+    target: lastProbe.target,
+    base_version: lastProbe.base_version,
+    probe_id: lastProbe.probe_id,
+  });
+  if (status === 200 && body.ok) {
+    msg.className = 'msg ok';
+    msg.textContent = `已切换到 ${body.current_target}（新版号 v${body.version}），新请求立即走新目标`;
+  } else if (status === 409) {
+    msg.className = 'msg err';
+    msg.textContent = `版号冲突：路由已被他人切换（当前 ${body.current_target} @v${body.current_version}），已刷新，请重新探测`;
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = `切换被拒绝：${body && body.error || status}`;
+  }
+  lastProbe = null;
+  await refresh();
+}
+
+function logReq(text, cls) {
+  const li = document.createElement('li');
+  li.id = 'req-' + (++reqSeq);
+  li.textContent = text;
+  if (cls) li.className = cls;
+  $('req-log').prepend(li);
+  return li.id;
+}
+
+async function fireOne(delay) {
+  const id = logReq(`→ 发起请求（延迟 ${delay}ms）…`);
+  const t0 = performance.now();
+  const { status, body } = await api('POST', '/api/call', { delay_ms: delay });
+  const dt = Math.round(performance.now() - t0);
+  const li = document.getElementById(id);
+  if (body && body.ok) {
+    li.className = 'done';
+    li.textContent = `✓ #${body.request_id.slice(0,8)} 由 ${body.target} 完整返回 · 耗时 ${dt}ms · 上游延迟 ${body.upstream.delay_ms}ms`;
+  } else {
+    li.className = 'fail';
+    li.textContent = `✗ ${status} ${body && (body.error || '') || ''}`;
+  }
+  refresh();
+}
+
+function fire(n) {
+  const d = Math.max(0, parseInt($('delay').value || '0', 10));
+  for (let i = 0; i < n; i++) fireOne(d);
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
