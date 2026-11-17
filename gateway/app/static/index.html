@@ -26,18 +26,28 @@
   .badge.cur { background: #1f9d55; color: #fff; }
   .badge.draining { background: #e8a13a; color: #fff; }
   .badge.offlinable { background: #607d8b; color: #fff; }
+  .badge.shared { background: #6a4c93; color: #fff; }
+  .badge.exec { background: #1266a8; color: #fff; }
   button { padding: 6px 14px; border: 0; border-radius: 6px; background: #1266a8;
            color: #fff; cursor: pointer; font-size: 14px; }
   button:disabled { background: #9db4c6; cursor: not-allowed; }
   button.warn { background: #c25e1d; }
+  button.ghost { background: #607d8b; }
   input, select { padding: 5px 8px; border: 1px solid #b9c4cf; border-radius: 6px; font-size: 14px; }
   ul { margin: 8px 0 0; padding-left: 18px; font-size: 13px; max-height: 220px; overflow-y: auto; }
   .msg { margin-top: 8px; font-size: 14px; min-height: 20px; }
   .msg.ok { color: #1f7a3d; }
   .msg.err { color: #b3261e; }
   .muted { color: #6b7a89; font-size: 12px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 10px; }
+  .stat { background: #f7f9fb; border: 1px solid #e3e8ee; border-radius: 6px; padding: 8px; }
+  .stat .n { font-size: 20px; font-weight: 600; }
+  .stat .l { font-size: 12px; color: #6b7a89; }
+  .stat.hl { background: #eef5fc; border-color: #bcd6ee; }
   #req-log li.done { color: #1f7a3d; }
+  #req-log li.shared { color: #6a4c93; }
   #req-log li.fail { color: #b3261e; }
+  #req-log li b { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -48,11 +58,30 @@
 <main>
   <section>
     <h2>发起转发请求</h2>
-    <label>响应延迟(ms) <input id="delay" type="number" value="3000" min="0" max="60000" style="width:90px"></label>
-    <button onclick="fire(1)">发送 1 个</button>
-    <button onclick="fire(5)">并发 5 个</button>
-    <span class="muted">请求在接纳时绑定当时的目标，切换后仍从原上游取回完整响应</span>
+    <div>
+      响应延迟(ms) <input id="delay" type="number" value="3000" min="0" max="60000" style="width:90px">
+      <button onclick="fire(1)">发送 1 个</button>
+      <button onclick="fire(5)">同时发 5 个</button>
+    </div>
+    <div class="muted" style="margin-top:6px">
+      相同路由版号 + 相同目标 + 相同 delay_ms 的同时请求只向上游执行一次；
+      每个调用者仍有独立在途记录并各自收到完整结果。请求在接纳时绑定当时的目标。
+    </div>
     <ul id="req-log"></ul>
+  </section>
+
+  <section>
+    <h2>请求合并 </h2>
+    <div class="stats" id="coalesce-stats"></div>
+    <div class="muted" id="coalesce-hint">
+      上游实际执行次数来自各上游自己的计数器（不含切换探测）。
+    </div>
+    <table style="margin-top:10px">
+      <thead><tr><th>上游</th><th>实际执行 /work</th><th>其中失败</th><th>探测</th><th>注入 /work 失败</th></tr></thead>
+      <tbody id="upstream-exec-body"></tbody>
+    </table>
+    <h2 style="margin-top:14px">最近完成的执行</h2>
+    <ul id="recent-exec"></ul>
   </section>
 
   <section>
@@ -76,14 +105,20 @@
     </table>
   </section>
 
-  <section>
+  <section style="grid-column: 1 / -1">
     <h2>在途请求明细</h2>
-    <ul id="inflight-list"></ul>
+    <div class="muted">每条都是独立的调用者；同一“执行号”的请求共享一次上游执行。</div>
+    <table style="margin-top:8px">
+      <thead><tr><th>调用者</th><th>目标</th><th>路径</th><th>已进行</th><th>执行号</th><th>本次共享</th><th>该执行调用者数</th></tr></thead>
+      <tbody id="inflight-list"></tbody>
+    </table>
   </section>
 </main>
 
 <script>
 let state = null;
+let upstreamStats = null;
+let statsAt = 0;
 let lastProbe = null;   // {target, base_version, probe_id, ok}
 let reqSeq = 0;
 const $ = (id) => document.getElementById(id);
@@ -100,13 +135,23 @@ async function api(method, path, body) {
   return { status: r.status, body: j };
 }
 
-function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function sid(id) { return id ? String(id).slice(0, 8) : '—'; }
 
 async function refresh() {
   try {
     const { body } = await api('GET', '/api/state');
     if (body) { state = body; render(); }
   } catch (e) { /* gateway restarting */ }
+  if (!statsAt || Date.now() - statsAt > 1500) refreshStats();
+}
+
+async function refreshStats() {
+  statsAt = Date.now();
+  try {
+    const { body } = await api('GET', '/api/upstream_stats');
+    if (body) { upstreamStats = body.upstreams; render(); }
+  } catch (e) { /* keep last known stats */ }
 }
 
 function render() {
@@ -132,16 +177,59 @@ function render() {
     .map(u => `<option value="${esc(u.name)}">${esc(u.name)}</option>`).join('');
   if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
 
-  $('inflight-list').innerHTML = state.inflight.map(x =>
-    `<li>#${x.id.slice(0,8)} → <b>${esc(x.target)}</b> ${esc(x.path)} · 已进行 ${x.age_ms}ms</li>`
-  ).join('') || '<li class="muted">（无在途请求）</li>';
+  renderCoalescing();
+  updateSwitchPanel();
+}
+
+function renderCoalescing() {
+  const c = state.coalescing;
+  const s = c.stats;
+  const shared = s.coalesced_joins;
+  $('coalesce-stats').innerHTML =
+    `<div class="stat"><div class="n">${s.client_requests}</div><div class="l">网页/客户端请求</div></div>` +
+    `<div class="stat hl"><div class="n">${s.upstream_executions}</div><div class="l">上游实际执行（网关）</div></div>` +
+    `<div class="stat"><div class="n">${shared}</div><div class="l">合并掉的重复请求</div></div>` +
+    `<div class="stat"><div class="n">${s.failed_executions}</div><div class="l">失败执行（已清除）</div></div>`;
+
+  const us = upstreamStats || {};
+  $('upstream-exec-body').innerHTML = state.upstreams.map(u => {
+    const d = us[u.name];
+    if (!d) return `<tr><td>${esc(u.name)}</td><td colspan="4" class="muted">查询中…</td></tr>`;
+    if (d.reachable === false)
+      return `<tr><td>${esc(u.name)}</td><td colspan="4" class="muted">不可达</td></tr>`;
+    const failBtn = d.work_fail
+      ? `<button class="ghost" onclick="setWorkMode('${esc(u.name)}', false)">恢复正常</button>`
+      : `<button class="warn" onclick="setWorkMode('${esc(u.name)}', true)">注入失败</button>`;
+    return `<tr><td>${esc(u.name)}</td><td>${d.work_executions}</td>` +
+           `<td>${d.failed_executions}</td><td>${d.probe_executions}</td><td>${failBtn}</td></tr>`;
+  }).join('');
+
+  $('recent-exec').innerHTML = c.recent_groups.slice().reverse().map(g =>
+    `<li>${new Date(g.finished_at*1000).toLocaleTimeString()} 执行 <b>#${sid(g.execution_id)}</b> ` +
+    `→ ${esc(g.target)}@v${g.route_version} · 延迟 ${g.delay_ms ?? '默认'}ms · ` +
+    `调用者 ${g.callers} 个 · ${g.ok ? '成功' : '失败 ' + esc(g.error || '')} · ${g.duration_ms}ms</li>`
+  ).join('') || '<li class="muted">（暂无）</li>';
+
+  const active = c.active_groups.length
+    ? ` · 进行中的共享执行 ${c.active_groups.length} 个`
+    : '';
+  $('coalesce-hint').textContent =
+    `上游实际执行次数来自各上游自己的计数器（不含切换探测）${active}。` +
+    `v${state.route.version} 之后接纳的请求不会加入旧版执行。`;
+
+  $('inflight-list').innerHTML = state.inflight.map(x => {
+    const shared = x.shared_execution
+      ? '<span class="badge shared">共享同一执行</span>'
+      : (x.upstream_executed ? '<span class="badge exec">本次上游执行</span>' : '<span class="muted">—</span>');
+    return `<tr><td>#${sid(x.id)}</td><td><b>${esc(x.target)}</b></td><td>${esc(x.path)}</td>` +
+           `<td>${x.age_ms}ms</td><td>${sid(x.execution_id)}</td><td>${shared}</td>` +
+           `<td>${x.execution_callers ?? 1}</td></tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">（无在途请求）</td></tr>';
 
   $('probe-log').innerHTML = state.recent_probes.map(p =>
     `<li>${new Date(p.created_at*1000).toLocaleTimeString()} 探测 <b>${esc(p.target)}</b> ` +
     `@页面版号 v${p.base_version} → ${p.ok ? '成功' : '失败 ' + esc(p.detail.error || JSON.stringify(p.detail))}</li>`
   ).join('') || '<li class="muted">（暂无）</li>';
-
-  updateSwitchPanel();
 }
 
 function updateSwitchPanel() {
@@ -195,6 +283,18 @@ async function doCommit() {
   await refresh();
 }
 
+async function setWorkMode(name, fail) {
+  const { body } = await api('POST', `/api/upstreams/${encodeURIComponent(name)}/work_mode`,
+                             { fail });
+  if (body && body.work_executions !== undefined) {
+    $('switch-msg').className = 'msg';
+    $('switch-msg').textContent = fail
+      ? `已在 ${name} 注入 /work 失败：新发起的请求会失败，执行结束后合并组立即清除`
+      : `已恢复 ${name} 的 /work`;
+  }
+  await refresh();
+}
+
 function logReq(text, cls) {
   const li = document.createElement('li');
   li.id = 'req-' + (++reqSeq);
@@ -211,8 +311,12 @@ async function fireOne(delay) {
   const dt = Math.round(performance.now() - t0);
   const li = document.getElementById(id);
   if (body && body.ok) {
-    li.className = 'done';
-    li.textContent = `✓ #${body.request_id.slice(0,8)} 由 ${body.target} 完整返回 · 耗时 ${dt}ms · 上游延迟 ${body.upstream.delay_ms}ms`;
+    const c = body.coalescing || {};
+    li.className = c.coalesced ? 'shared' : 'done';
+    li.innerHTML = (c.coalesced
+        ? `↺ #${sid(body.request_id)} 共享执行 #${sid(c.execution_id)}（${c.execution_callers} 个调用者合并为 1 次上游执行）`
+        : `✓ #${sid(body.request_id)} 由 ${esc(body.target)} 执行 · 执行号 #${sid(c.execution_id)}`) +
+      ` · 耗时 ${dt}ms · 上游延迟 ${body.upstream.delay_ms}ms`;
   } else {
     li.className = 'fail';
     li.textContent = `✗ ${status} ${body && (body.error || '') || ''}`;

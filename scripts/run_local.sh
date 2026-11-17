@@ -3,6 +3,8 @@
 # runs the smoke test, kills the gateway mid-request, restarts it, and checks
 # recovery. Mirrors what docker-compose.yml wires up for containers.
 set -euo pipefail
+# Pick up the locally installed uvicorn/pip user scripts if the venv is absent.
+export PATH="$HOME/.local/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${WORK_DIR:-/tmp/edge-gw-demo}"
@@ -34,7 +36,10 @@ start_gateway() {
     "$PY" -m uvicorn app.main:app --app-dir "$ROOT/gateway" \
       --host 127.0.0.1 --port "$GW_PORT" --log-level warning \
       >>"$WORK/gateway.log" 2>&1 &
-  PIDS+=($!)
+  # Remember the gateway PID separately: PIDS also holds the upstreams, and the
+  # crash simulation below must only ever kill the gateway.
+  GW_PID=$!
+  PIDS+=("$GW_PID")
 }
 
 wait_ready() { # url
@@ -56,6 +61,21 @@ echo "== 启动网关(:$GW_PORT) =="
 start_gateway
 wait_ready "http://127.0.0.1:$GW_PORT/api/health"
 
+echo "== 阶段零 A：合并逻辑单元检查 =="
+"$PY" -I "$ROOT/scripts/coalesce_unit_test.py"
+
+echo "== 阶段零 B：在途请求合并端到端 =="
+"$PY" "$ROOT/scripts/coalesce_test.py" "http://127.0.0.1:$GW_PORT"
+
+# Restart the gateway on a fresh database so the switch scenario below keeps
+# its documented starting point (alpha@v0), unaffected by the coalescing phase.
+echo "== 重置网关数据库，恢复 alpha@v0 =="
+kill "$GW_PID" 2>/dev/null || true
+sleep 0.5
+rm -f "$WORK/gateway.db" "$WORK/gateway.db-wal" "$WORK/gateway.db-shm"
+start_gateway
+wait_ready "http://127.0.0.1:$GW_PORT/api/health"
+
 echo "== 阶段一：切换语义 =="
 "$PY" "$ROOT/scripts/smoke_test.py" "http://127.0.0.1:$GW_PORT" "$SAVE" phase1 &
 SMOKE=$!
@@ -64,7 +84,6 @@ SMOKE=$!
 for _ in $(seq 1 300); do [ -f "$SAVE" ] && break; sleep 0.1; done
 [ -f "$SAVE" ] || { echo "phase1 未到达重启点" >&2; exit 1; }
 
-GW_PID="${PIDS[-1]}"
 echo "== kill -9 网关（模拟崩溃，beta 上仍有 1 条在途请求） =="
 kill -9 "$GW_PID" 2>/dev/null || true
 wait "$SMOKE"

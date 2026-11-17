@@ -128,9 +128,14 @@ def admit(path: str) -> dict:
     return {"id": rid, "target": route["current_target"], "version": route["version"]}
 
 
-def finish(request_id: str) -> None:
+def finish_many(request_ids: set[str]) -> None:
+    """Release the in-flight rows of every caller of one shared execution."""
+    if not request_ids:
+        return
     with _lock, _db() as conn:
-        conn.execute("DELETE FROM inflight WHERE id = ?", (request_id,))
+        conn.executemany(
+            "DELETE FROM inflight WHERE id = ?", [(rid,) for rid in request_ids]
+        )
 
 
 def record_probe(target: str, base_version: int, ok: bool, detail: dict) -> dict:
